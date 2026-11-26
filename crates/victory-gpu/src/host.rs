@@ -5753,6 +5753,11 @@ float4 ps(float4 pos : SV_Position) : SV_Target {
         let pixels = (width * height) as usize;
         let spin = Spin::new(host, width, height);
         let mut tag = 1;
+        // A first draw, not timed: on an M1 Max (macOS 15) the first draw
+        // took 24.5 ms where a warm one of the same size takes 3.7 ms, so
+        // the calibration stopped there, came out about 100 times too slow,
+        // and the "4 s" draws ran whole in 43 ms.
+        spin.draw(host, 1, tag);
         // Loop passes per millisecond, from a draw of 20 to 40 ms.
         let mut n = 1024u32;
         let per_ms = loop {
@@ -5766,7 +5771,9 @@ float4 ps(float4 pos : SV_Position) : SV_Target {
         };
         let long = (per_ms * 4000.0).min(f64::from(u32::MAX)) as u32;
         let [lost, queues] = [0, 1].map(|i| LOST[i].load(Ordering::Relaxed));
-        for _ in 0..8 {
+        // On an M1 Max (macOS 15) the queue stopped after 2 to 30 ended
+        // draws (12 runs), each about 260 ms, so 8 tries often fell short.
+        for _ in 0..64 {
             tag += 1;
             let (_, ran) = spin.draw(host, long, tag);
             assert_ne!(ran, pixels, "macOS ends a draw of about 4 s");
