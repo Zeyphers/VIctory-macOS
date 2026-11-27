@@ -245,6 +245,13 @@ mod tests {
         }
     }
 
+    /// The tick the clock is in now, as [`next_tick`] counts it.
+    fn now() -> u64 {
+        let c = clock();
+        let c = c.as_ref().expect("a clock");
+        c.first + (c.start.elapsed().as_nanos() / c.interval.as_nanos().max(1)) as u64
+    }
+
     #[test]
     fn waits_end_on_ticks_and_count_frames() {
         let null = std::ptr::null();
@@ -260,17 +267,24 @@ mod tests {
         // A wait that ended on its tick, not on its 1 s time-out. The
         // bound is wide because a busy CI host can wake a thread late.
         assert!(before.elapsed() < Duration::from_millis(500), "{:?}", before.elapsed());
-        assert_eq!(wait(null, 0, 0, std::ptr::null(), 0, &mut second), TIMEOUT);
-        // Tokens count frames, a frame started early on a time-out too.
-        let mut early = 0;
-        let flags = TOKEN_ON_TIMEOUT;
-        assert_eq!(
-            wait(null, 0, 0, std::ptr::null(), flags, &mut early),
-            TIMEOUT
-        );
-        let mut next = 0;
-        assert_eq!(wait(null, 0, 1_000, std::ptr::null(), 0, &mut next), S_OK);
-        assert!(early == second + 1 && next == early + 1);
+        // The time-outs below need the next tick still ahead. macOS can wake
+        // a background process's thread a whole interval late (#324); it
+        // then finds that tick passed, and its wait rightly ends on it.
+        if now() == LAST[0].load(Ordering::Relaxed) {
+            assert_eq!(wait(null, 0, 0, std::ptr::null(), 0, &mut second), TIMEOUT);
+            // Tokens count frames, a frame started early on a time-out too.
+            let mut early = 0;
+            let flags = TOKEN_ON_TIMEOUT;
+            assert_eq!(
+                wait(null, 0, 0, std::ptr::null(), flags, &mut early),
+                TIMEOUT
+            );
+            let mut next = 0;
+            assert_eq!(wait(null, 0, 1_000, std::ptr::null(), 0, &mut next), S_OK);
+            assert!(early == second + 1 && next == early + 1);
+        } else {
+            eprintln!("woken a tick late: the time-out checks are skipped this run");
+        }
         assert!(LAST[0].load(Ordering::Relaxed) >= 2);
 
         // The title's loop (the clock is global, so in the same test): an
@@ -281,17 +295,26 @@ mod tests {
         // 5 ms ticks) still makes its tick.
         assert_eq!(set_interval(null, null, 50_000, 3, 0), S_OK);
         let mut token = 0;
-        let flips: Vec<u64> = (0..4)
-            .map(|_| {
-                let _ = wait(null, 0, 0, std::ptr::null(), TOKEN_ON_TIMEOUT, &mut token);
-                assert_eq!(
-                    wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token),
-                    S_OK
-                );
-                LAST[2].load(Ordering::Relaxed)
-            })
-            .collect();
-        assert!(flips.windows(2).all(|w| w[1] == w[0] + 1), "{flips:?}");
+        let mut flips = vec![LAST[2].load(Ordering::Relaxed)];
+        for _ in 0..4 {
+            let _ = wait(null, 0, 0, std::ptr::null(), TOKEN_ON_TIMEOUT, &mut token);
+            let passed = now();
+            assert_eq!(
+                wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token),
+                S_OK
+            );
+            let flip = LAST[2].load(Ordering::Relaxed);
+            // The tick after the last flip, or the latest one passed if this
+            // thread got here after it (woken late, #324); one more if a
+            // tick passed between `now` and the wait.
+            let due = (flips[flips.len() - 1] + 1).max(passed);
+            assert!(
+                flip == due || flip == due + 1,
+                "{flip} due {due} after {flips:?}"
+            );
+            flips.push(flip);
+        }
+        let flips = &flips[1..];
         // Even when a flip wait begins on the tick another just ended on.
         let (tick, _) = next_tick(FLIP, Duration::ZERO);
         assert!(tick > flips[3]);
