@@ -1365,12 +1365,13 @@ struct FileKeys {
     /// against them (the file is tiny key-name lines, so keeping them costs
     /// nothing).
     consumed: Vec<u8>,
-    /// Keys of complete lines, in file order, not yet pressed.
-    pending: VecDeque<u8>,
+    /// Keys of complete lines and how long each is held, in file order, not
+    /// yet pressed.
+    pending: VecDeque<(u8, Duration)>,
     /// When the file was last looked at, since input started.
     looked: Duration,
-    /// The press in progress: when it started, which key.
-    held: Option<(Duration, u8)>,
+    /// The press in progress: when it started, which key, for how long.
+    held: Option<(Duration, u8, Duration)>,
 }
 
 #[cfg(any(test, windows))]
@@ -1410,30 +1411,46 @@ impl FileKeys {
         for line in lines {
             let name = String::from_utf8_lossy(line);
             tracing::info!(key = %name, "a key was asked for (VICTORY_KEYS_FILE)");
-            if let Some(vk) = key_named(name.trim()) {
-                self.pending.push_back(vk);
+            if let Some(press) = file_press(&name) {
+                self.pending.push_back(press);
             }
         }
     }
 
-    /// The key to hold at `now`: each queued key is pressed for [`PRESS`],
-    /// then released for two more so the title sees separate presses.
+    /// The key to hold at `now`: each queued key is pressed for its line's
+    /// time ([`PRESS`] unless the line names one), then released for
+    /// `2 * PRESS` so the title sees separate presses.
     fn take_held(&mut self, now: Duration) -> Option<u8> {
-        if let Some((since, vk)) = self.held {
+        if let Some((since, vk, hold)) = self.held {
             let age = now.saturating_sub(since);
-            if age < PRESS {
+            if age < hold {
                 return Some(vk);
             }
             // A gap between two presses, so the title sees each one.
-            if age < PRESS * 3 {
+            if age < hold + PRESS * 2 {
                 return None;
             }
             self.held = None;
         }
-        let vk = self.pending.pop_front()?;
-        self.held = Some((now, vk));
+        let (vk, hold) = self.pending.pop_front()?;
+        self.held = Some((now, vk, hold));
         Some(vk)
     }
+}
+
+/// A `VICTORY_KEYS_FILE` line: `<key>` (held [`PRESS`]) or `<key> <seconds>`;
+/// `None` for an unknown key or a time that is not a positive number.
+#[cfg(any(test, windows))]
+fn file_press(line: &str) -> Option<(u8, Duration)> {
+    let mut words = line.split_whitespace();
+    let vk = key_named(words.next()?)?;
+    let hold = match words.next() {
+        None => PRESS,
+        Some(secs) => Duration::try_from_secs_f64(secs.parse().ok()?)
+            .ok()
+            .filter(|d| !d.is_zero())?,
+    };
+    words.next().is_none().then_some((vk, hold))
 }
 
 #[cfg(test)]
@@ -1613,6 +1630,25 @@ mod script_tests {
     }
 
     #[test]
+    fn keys_file_lines_can_name_how_long_to_hold() {
+        assert_eq!(file_press("W"), Some((b'W', PRESS)));
+        assert_eq!(file_press(" W 2.5 "), Some((b'W', s(2.5))));
+        for bad in ["W 0", "W -1", "W x", "W NaN", "W 1 2", "Walk 1"] {
+            assert_eq!(file_press(bad), None, "{bad}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keys");
+        std::fs::write(&path, b"L 3\nW\n").unwrap();
+        let mut keys = FileKeys::default();
+        keys.poll(&path, s(0.2));
+        assert_eq!(keys.take_held(s(0.2)), Some(b'L'));
+        assert_eq!(keys.take_held(s(3.1)), Some(b'L')); // held 3 s
+        assert_eq!(keys.take_held(s(3.3)), None); // then the gap
+        assert_eq!(keys.take_held(s(3.7)), Some(b'W'));
+        assert_eq!(keys.take_held(s(3.95)), None); // a plain line: 0.2 s
+    }
+
+    #[test]
     fn keys_file_restarts_on_a_shorter_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("keys");
@@ -1625,7 +1661,7 @@ mod script_tests {
         keys.poll(&path, s(0.4));
         assert_eq!(keys.offset, 4);
         assert_eq!(
-            keys.pending.iter().copied().collect::<Vec<_>>(),
+            keys.pending.iter().map(|&(vk, _)| vk).collect::<Vec<_>>(),
             vec![0x0D, 0x1B, 0x09]
         );
     }
@@ -1857,7 +1893,9 @@ mod host {
     /// pressed for 0.2 s once its line is complete (newline-terminated), in
     /// order, so a script watching the log can press a key exactly when a
     /// screen is ready (`Add-Content <path> Enter`); a line still being
-    /// written is left for the next look.
+    /// written is left for the next look. `<key> <seconds>` holds the key
+    /// that long instead (`W 20` walks for 20 s), for steering the player
+    /// when frames are slow and a 0.2 s tap moves next to nothing.
     ///
     /// In every build, so that unattended runs can get past the title's
     /// prompts; unset, it holds nothing.
