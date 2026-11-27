@@ -628,13 +628,14 @@ impl Shadow {
     }
 
     /// A zero-copy shadow whose title range `[start, start + len)` shares
-    /// physical pages with `buffer` (`mach_vm_remap`).
+    /// physical pages with `buffer` from `base` on (`mach_vm_remap`).
     pub(crate) fn new_aliased(
         buffer: ID3D12Resource,
         data: *mut u8,
         gpu: u64,
         start: u64,
         len: u64,
+        base: u64,
     ) -> Arc<Shadow> {
         let marks = marks().take(pages(start, len));
         let shadow = Arc::new(Shadow {
@@ -650,7 +651,7 @@ impl Shadow {
             widened: Mutex::default(),
             widened_source: Mutex::default(),
             has_widened: AtomicBool::new(false),
-            base: 0,
+            base,
             slice: None,
             aliased: true,
             sums: Mutex::default(),
@@ -4589,7 +4590,7 @@ pub(crate) mod tests {
         let outer = find(base + 0x100, 64).expect("outer shadow");
         assert!(!outer.is_aliased());
 
-        let aliased = Shadow::new_aliased(buffer, data, gpu, base, 0x10000);
+        let aliased = Shadow::new_aliased(buffer, data, gpu, base, 0x10000, 0);
         register_aliased(aliased.clone());
         let hit = find(base + 0x100, 64).expect("aliased shadow");
         assert!(hit.is_aliased());

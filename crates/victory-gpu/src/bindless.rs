@@ -1137,7 +1137,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         let alias_gpu = unsafe { alias_buf.GetGPUVirtualAddress() };
         let alias_base = 0x7000_0000_0000u64;
         let ca = Arc::new(Shadow::new_aliased(
-            alias_buf, alias_data, alias_gpu, alias_base, 0x1000,
+            alias_buf, alias_data, alias_gpu, alias_base, 0x1000, 0,
         ));
         assert!(ca.dirty_bit().is_none());
         assert!(ca.clean(), "fresh aliased shadow without widened SRVs is clean");
