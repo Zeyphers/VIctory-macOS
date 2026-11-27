@@ -100,6 +100,14 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
             .entry(*full.as_bytes())
             .or_insert_with(|| {
                 created = true;
+                // The programs the ambient stand-in follows are known by name
+                // (`crate::ambient`; nothing while it is off).
+                #[cfg(windows)]
+                crate::ambient::note_program(&full.to_hex()[..16], bytes);
+                // So are the ray passes `VICTORY_RAY_SKIP` leaves out
+                // (`crate::ray_skip`; nothing while it is off).
+                #[cfg(windows)]
+                crate::ray_skip::note_program(stage, &full.to_hex()[..16], bytes);
                 Arc::new(Shader::with_hash(stage, bytes, full))
             })
             .clone()
@@ -195,6 +203,12 @@ impl Shader {
 pub(crate) struct Translated {
     pub(crate) host: victory_shader::emit::HostShader,
     pub(crate) used: Vec<victory_shader::UsedResource>,
+    /// Per [`Translated::used`] entry: a buffer store or atomic names that
+    /// table UAV descriptor. Empty when the shader's code is not known.
+    pub(crate) used_written: Vec<bool>,
+    /// Whether any buffer store or atomic could not be matched to a known
+    /// descriptor in [`Translated::used`], so all table UAVs keep writeback.
+    pub(crate) write_unknown: bool,
 }
 
 #[cfg(windows)]
@@ -215,11 +229,17 @@ impl Shader {
                     let done = translate(&container);
                     // After the translation, not before: if it panics, the
                     // bytes are still there for the next try.
-                    let keep = link_mesh_outputs() && done.0.as_ref().is_ok_and(|t| {
-                        self.stage == "pixel"
-                            || (self.stage == "mesh"
-                                && over_limit_mesh_output_bytes(&t.host.dxil).is_some())
-                    });
+                    let keep = (link_mesh_outputs()
+                        && done.0.as_ref().is_ok_and(|t| {
+                            self.stage == "pixel"
+                                || (self.stage == "mesh"
+                                    && over_limit_mesh_output_bytes(&t.host.dxil).is_some())
+                        }))
+                        || (mesh_per_vertex_center()
+                            && self.stage == "pixel"
+                            && done.0.as_ref().is_ok_and(|t| {
+                                victory_shader::emit::needs_vertex_deltas(&t.host.dxil)
+                            }));
                     if !keep {
                         *container = Vec::new();
                     }
@@ -240,22 +260,24 @@ impl Shader {
                             kernel_ms,
                             "shader translated"
                         );
-                        // D3DMetal makes such a pipeline and marks it a no-op:
-                        // its draws are dropped without an error (#132).
+                        // D3DMetal makes such a pipeline and marks it a no-op
+                        // or hangs the queue (#132, #172).
                         use victory_shader::emit::{METAL_MESH_OUTPUT_BYTES, mesh_outputs};
-                        if let Some(o) = mesh_outputs(&t.host.dxil)
-                            .filter(|o| o.bytes() > METAL_MESH_OUTPUT_BYTES)
-                            .filter(|_| crate::shader_cache::under_wine())
+                        if let (Some(o), Some(bytes)) =
+                            (mesh_outputs(&t.host.dxil), metal_mesh_output_bytes(&t.host.dxil))
+                            && bytes > METAL_MESH_OUTPUT_BYTES
+                            && crate::shader_cache::under_wine()
                         {
                             tracing::warn!(
                                 hash = %self.hash,
-                                bytes = o.bytes(),
+                                bytes,
+                                packed_bytes = o.bytes(),
                                 limit = METAL_MESH_OUTPUT_BYTES,
                                 vertices = o.vertices,
                                 primitives = o.primitives,
                                 vertex_components = o.vertex_components,
                                 primitive_components = o.primitive_components,
-                                "mesh shader outputs exceed Metal's limit; its draws are likely dropped"
+                                "mesh shader outputs exceed Metal's limit; linking or refusing on host"
                             );
                         }
                     }
@@ -312,21 +334,158 @@ fn with_resources(
 ) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
     let c = Container::parse(container).map_err(|e| e.to_string())?;
-    let used = match c.part(FourCC::DXIL).or(c.part(FourCC::ACCC)) {
-        Some(part) => victory_shader::native_programs(part.data)
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .find(|p| {
-                matches!(
-                    p.stage,
-                    HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
-                )
-            })
-            .map(|p| p.used)
-            .unwrap_or_default(),
+    let programs = match c.part(FourCC::DXIL).or(c.part(FourCC::ACCC)) {
+        Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
-    Ok(Translated { host, used })
+    let chosen = programs.iter().find(|p| {
+        matches!(
+            p.stage,
+            HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
+        )
+    });
+    let used = chosen.map(|p| p.used.clone()).unwrap_or_default();
+    let (used_written, mut write_unknown) = chosen
+        .map(|p| written_used(p, &used))
+        .unwrap_or((Vec::new(), !programs.is_empty()));
+    if programs.len() > 1 {
+        // Another stage in the container could store through a shared table.
+        write_unknown = true;
+    }
+    Ok(Translated {
+        host,
+        used,
+        used_written,
+        write_unknown,
+    })
+}
+
+/// Which [`Translated::used`] table UAV descriptors a buffer store or atomic
+/// names. Traces every buffer/SMEM store or atomic through
+/// [`victory_shader::resource::track`] back to its root-table `(user_data,
+/// table_offset_dwords)` descriptor; any store whose target cannot be resolved
+/// to a known root or table descriptor (or goes through the dynamic resource
+/// heap) sets `write_unknown` so all table UAVs keep writeback.
+#[cfg(windows)]
+fn written_used(
+    program: &victory_shader::NativeProgram,
+    used: &[victory_shader::UsedResource],
+) -> (Vec<bool>, bool) {
+    use std::collections::HashMap;
+    use victory_shader::gfx10::Encoding;
+    use victory_shader::resource::{Role, Source};
+    use victory_shader::{ResourceType, RootType};
+
+    let Ok(ir) = victory_shader::ir::build(&program.code, program.wave64, program.vgprs) else {
+        return (vec![true; used.len()], true);
+    };
+    let st = victory_shader::structure::structure(&ir).ok();
+    let Ok(res) = victory_shader::resource::track(&ir, &program.layout, program.stage, st.as_ref())
+    else {
+        return (vec![true; used.len()], true);
+    };
+    let scalar: HashMap<_, _> = res.scalar.iter().copied().collect();
+    let descriptors: HashMap<_, _> = res
+        .descriptors
+        .iter()
+        .filter(|d| d.role == Role::Resource)
+        .map(|d| (d.site, &d.source))
+        .collect();
+
+    let mut written = vec![false; used.len()];
+    let mut unknown = false;
+    for (bi, block) in ir.blocks.iter().enumerate() {
+        for (ii, inst) in block.insts.iter().enumerate() {
+            let is_buffer_write = match inst.machine.encoding {
+                Encoding::Mubuf | Encoding::Mtbuf | Encoding::Smem => {
+                    let name = inst.name();
+                    name.is_empty() || name.contains("store") || name.contains("atomic")
+                }
+                _ => false,
+            };
+            if !is_buffer_write {
+                continue;
+            }
+            let Some(source) = descriptors.get(&(bi, ii)) else {
+                // `s_store_*` / `s_atomic_*` write via a scalar address rather
+                // than a descriptor; root descriptors are tracked separately.
+                if let Some(addr) = scalar.get(&(bi, ii))
+                    && program
+                        .layout
+                        .get(addr.param)
+                        .is_some_and(|rp| rp.root == RootType::Descriptor)
+                {
+                    continue;
+                }
+                unknown = true;
+                continue;
+            };
+            for leaf in source.leaves() {
+                match leaf {
+                    Source::Loaded { load, first } => {
+                        let Some(addr) = scalar.get(load) else {
+                            unknown = true;
+                            continue;
+                        };
+                        let Some(rp) = program.layout.get(addr.param) else {
+                            unknown = true;
+                            continue;
+                        };
+                        match rp.root {
+                            RootType::Table => {
+                                if addr.dynamic.is_some() {
+                                    let mut any = false;
+                                    for (i, u) in used.iter().enumerate() {
+                                        if u.root == RootType::Table
+                                            && u.user_data == rp.user_data
+                                            && u.kind == ResourceType::Uav
+                                        {
+                                            written[i] = true;
+                                            any = true;
+                                        }
+                                    }
+                                    if !any {
+                                        unknown = true;
+                                    }
+                                } else {
+                                    let dword = (addr.offset / 4) + u32::from(*first);
+                                    let hit = used
+                                        .iter()
+                                        .enumerate()
+                                        .filter(|(_, u)| {
+                                            u.root == RootType::Table
+                                                && u.user_data == rp.user_data
+                                                && u.table_offset_dwords <= dword
+                                        })
+                                        .max_by_key(|(_, u)| u.table_offset_dwords);
+                                    if let Some((i, u)) = hit
+                                        && u.kind == ResourceType::Uav
+                                    {
+                                        written[i] = true;
+                                    } else {
+                                        unknown = true;
+                                    }
+                                }
+                            }
+                            RootType::Descriptor => {}
+                            _ => {
+                                unknown = true;
+                            }
+                        }
+                    }
+                    Source::Built { address, .. }
+                        if program
+                            .layout
+                            .get(address.param)
+                            .is_some_and(|rp| rp.root == RootType::Descriptor) => {}
+                    _ => {
+                        unknown = true;
+                    }
+                }
+            }
+        }
+    }
+    (written, unknown)
 }
 
 #[cfg(windows)]
@@ -338,6 +497,23 @@ fn link_mesh_outputs() -> bool {
         Some(v) => crate::switch::value_is_on(Some(&v)),
         None => crate::shader_cache::under_wine(),
     })
+}
+
+/// Whether mesh+pixel pipelines whose pixel shader reads non-provoking vertex
+/// values (`VICTORY_P10`/`VICTORY_P20`) fall back to center interpolation
+/// (`per_vertex_center`) instead of being refused (`VICTORY_MESH_PER_VERTEX_CENTER=0`
+/// disables). Default on.
+#[cfg(windows)]
+pub(crate) fn mesh_per_vertex_center() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        mesh_per_vertex_center_value(std::env::var_os("VICTORY_MESH_PER_VERTEX_CENTER").as_deref())
+    })
+}
+
+#[cfg(any(windows, test))]
+fn mesh_per_vertex_center_value(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("0"))
 }
 
 /// Whether a mesh pipeline whose outputs are still over Metal's 32 KiB after
@@ -361,10 +537,22 @@ struct LinkedPair {
 }
 
 #[cfg(windows)]
-type LinkedKey = ([u8; 32], Option<[u8; 32]>);
+type LinkedKey = ([u8; 32], Option<[u8; 32]>, bool);
 
 #[cfg(windows)]
 impl Shader {
+    fn container_bytes(&self) -> Vec<u8> {
+        let container = self.container.lock().unwrap_or_else(|e| e.into_inner());
+        if !container.is_empty() {
+            return container.clone();
+        }
+        drop(container);
+        if let (Some(full), Some(dir)) = (self.spilled.get(), SPILL_DIR.get()) {
+            return crate::read_file(&spill_path(dir, full)).unwrap_or_default();
+        }
+        Vec::new()
+    }
+
     fn with_translation(&self, translated: Translated) -> Arc<Shader> {
         let cell = OnceLock::new();
         let _ = cell.set(Some(translated));
@@ -383,13 +571,17 @@ impl Shader {
 /// Re-translates a mesh shader together with its paired pixel shader (if any)
 /// so arbitrary mesh outputs unread by the pixel shader are pruned under
 /// Metal's 32 KiB mesh output limit (`victory_shader::emit::METAL_MESH_OUTPUT_BYTES`).
+/// When `per_vertex_center` is set, non-provoking vertex reads in the pixel
+/// shader are lowered to center interpolation instead of requesting geometry-
+/// shader vertex deltas.
 #[cfg(windows)]
 pub(crate) fn translate_linked(
     ms: &Shader,
     ps: Option<&Shader>,
+    per_vertex_center: bool,
 ) -> Option<(Arc<Shader>, Option<Arc<Shader>>)> {
     static LINKED: Mutex<Option<HashMap<LinkedKey, Option<LinkedPair>>>> = Mutex::new(None);
-    let key = (ms.full_hash, ps.map(|p| p.full_hash));
+    let key = (ms.full_hash, ps.map(|p| p.full_hash), per_vertex_center);
     if let Some(hit) = LINKED
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -400,18 +592,10 @@ pub(crate) fn translate_linked(
             .as_ref()
             .map(|pair| (pair.mesh.clone(), pair.pixel.clone()));
     }
-    let mesh_bytes = ms
-        .container
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
-    let pixel_bytes = ps.map(|p| {
-        p.container
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-    });
-    let options = crate::shader_cache::runtime_options();
+    let mesh_bytes = ms.container_bytes();
+    let pixel_bytes = ps.map(Shader::container_bytes);
+    let mut options = crate::shader_cache::runtime_options();
+    options.per_vertex_center = per_vertex_center;
     let result = match victory_shader::emit::translate_linked(
         &mesh_bytes,
         pixel_bytes.as_deref(),
@@ -419,22 +603,30 @@ pub(crate) fn translate_linked(
     ) {
         Ok((ms_host, ps_host)) => {
             let ms_bytes = metal_mesh_output_bytes(&ms_host.dxil);
-            let ms_used = ms.translated()?.used.clone();
+            let ms_t = ms.translated()?;
             let mesh = ms.with_translation(Translated {
                 host: ms_host,
-                used: ms_used,
+                used: ms_t.used.clone(),
+                used_written: ms_t.used_written.clone(),
+                write_unknown: ms_t.write_unknown,
             });
             let pixel = match (ps, ps_host) {
-                (Some(p), Some(host)) => Some(p.with_translation(Translated {
-                    host,
-                    used: p.translated()?.used.clone(),
-                })),
+                (Some(p), Some(host)) => {
+                    let p_t = p.translated()?;
+                    Some(p.with_translation(Translated {
+                        host,
+                        used: p_t.used.clone(),
+                        used_written: p_t.used_written.clone(),
+                        write_unknown: p_t.write_unknown,
+                    }))
+                }
                 _ => None,
             };
             tracing::info!(
                 mesh = %ms.hash,
                 pixel = ps.map_or("none", |p| p.hash.as_str()),
                 bytes = ms_bytes,
+                per_vertex_center,
                 "mesh and pixel outputs linked"
             );
             Some(LinkedPair { mesh, pixel })
@@ -443,6 +635,7 @@ pub(crate) fn translate_linked(
             tracing::warn!(
                 mesh = %ms.hash,
                 pixel = ps.map_or("none", |p| p.hash.as_str()),
+                per_vertex_center,
                 error = %e,
                 "linked mesh/pixel translation failed; using standalone translation"
             );
@@ -458,6 +651,62 @@ pub(crate) fn translate_linked(
         .get_or_insert_with(HashMap::new)
         .insert(key, result);
     out
+}
+
+/// Re-translates a pixel shader with `per_vertex_center` so a mesh pipeline
+/// whose mesh stage already fits Metal's 32 KiB limit can run without
+/// geometry-shader vertex deltas.
+#[cfg(windows)]
+pub(crate) fn translate_pixel_center(ps: &Shader) -> Option<Arc<Shader>> {
+    type CenterCache = HashMap<[u8; 32], Option<Arc<Shader>>>;
+    static CENTER: Mutex<Option<CenterCache>> = Mutex::new(None);
+    if let Some(hit) = CENTER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(&ps.full_hash))
+    {
+        return hit.clone();
+    }
+    let bytes = ps.container_bytes();
+    let result = if bytes.is_empty() {
+        None
+    } else {
+        let mut options = crate::shader_cache::runtime_options();
+        options.per_vertex_center = true;
+        match victory_shader::emit::translate_with(&bytes, options) {
+            Ok(host) => {
+                let ps_t = ps.translated()?;
+                let used = ps_t.used.clone();
+                let (used_written, write_unknown) =
+                    (ps_t.used_written.clone(), ps_t.write_unknown);
+                tracing::info!(
+                    pixel = %ps.hash,
+                    "pixel shader re-translated with center-interpolated per-vertex fallback for mesh pipeline"
+                );
+                Some(ps.with_translation(Translated {
+                    host,
+                    used,
+                    used_written,
+                    write_unknown,
+                }))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    pixel = %ps.hash,
+                    error = %e,
+                    "pixel shader center-interpolated per-vertex fallback failed"
+                );
+                None
+            }
+        }
+    };
+    CENTER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .insert(ps.full_hash, result.clone());
+    result
 }
 
 #[repr(C)]
@@ -476,6 +725,14 @@ struct Pipeline {
     /// ([`builder`]).
     #[cfg(windows)]
     builder: bool,
+    /// What its programs are to the ambient stand-in ([`crate::ambient`]):
+    /// bits, 0 for nothing (always while the stand-in is off).
+    #[cfg(windows)]
+    ambient: u8,
+    /// Which ray pass `VICTORY_RAY_SKIP` leaves out it is
+    /// ([`ray_pass_left_out`]): bits, 0 for none (always while it is off).
+    #[cfg(windows)]
+    ray_pass: u8,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -514,12 +771,54 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
+/// As [`host_pipeline`], for a draw into render target and depth views of
+/// the formats `bound`.
+#[cfg(windows)]
+pub(crate) fn host_pipeline_for<'a>(
+    this: This,
+    bound: &host::TargetFormats,
+) -> Option<&'a host::HostPipeline> {
+    if this.is_null() {
+        return None;
+    }
+    let p = &pipeline(this).host;
+    if p.formats != *bound && host::formats_differ(&p.formats, bound) {
+        return make::for_formats(p, bound);
+    }
+    make::ready(p)
+}
+
 /// Whether a dispatch with the title pipeline is held back: it is the
 /// acceleration-structure builder's, which does not run this frame
 /// ([`builder::runs`]).
 #[cfg(windows)]
 pub(crate) fn held_back(this: This) -> bool {
     !this.is_null() && pipeline(this).builder && !builder::runs()
+}
+
+/// Whether a dispatch with the title pipeline is left out: it is one of
+/// the ray passes `VICTORY_RAY_SKIP` names (`crate::ray_skip`), and the
+/// acceleration-structure builder does not run this frame
+/// ([`builder::runs`]), so there is nothing to trace against. Counted
+/// there when it is.
+#[cfg(windows)]
+pub(crate) fn ray_pass_left_out(this: This) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    let kind = pipeline(this).ray_pass;
+    if kind == 0 || builder::runs() {
+        return false;
+    }
+    crate::ray_skip::left_out(kind);
+    true
+}
+
+/// What the title pipeline's programs are to the ambient stand-in
+/// ([`crate::ambient`]): bits, 0 for nothing.
+#[cfg(windows)]
+pub(crate) fn ambient_role(this: This) -> u8 {
+    if this.is_null() { 0 } else { pipeline(this).ambient }
 }
 
 /// A title DLL was mapped at `base`, `size` bytes (the acceleration-
@@ -674,6 +973,15 @@ fn hand_out(
     if builder {
         builder::note(&host);
     }
+    #[cfg(windows)]
+    let ambient = crate::ambient::role(shaders.iter().map(|s| s.hash.as_str()));
+    // Never a program the stand-in works after (it would not run).
+    #[cfg(windows)]
+    let ray_pass = if ambient == 0 {
+        crate::ray_skip::kind(shaders.iter().map(|s| s.hash.as_str()))
+    } else {
+        0
+    };
     let pipeline = Box::new(Pipeline {
         object: Object::new(&FUNCTIONS),
         packet: [0; 8],
@@ -681,6 +989,10 @@ fn hand_out(
         host,
         #[cfg(windows)]
         builder,
+        #[cfg(windows)]
+        ambient,
+        #[cfg(windows)]
+        ray_pass,
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
@@ -1280,6 +1592,106 @@ mod tests {
         put(&mut stream, 0x1e0, 10 | 2 << 32);
         // SAFETY: as above.
         assert_ne!(unsafe { Prebuild::graphics(&stream) }.key(), title.host.key);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn table_uav_store_marks_only_its_own_table_entry() {
+        use victory_shader::{HwStage, NativeProgram, ResourceType, RootParam, RootType, UsedResource};
+
+        // Table root parameter at user_data s0 (slot 0) holding two UAVs:
+        // u0 at table dword offset 0 (byte offset 0x00) and u1 at dword offset 8 (byte offset 0x20).
+        let layout = vec![RootParam {
+            slot: 0,
+            root: RootType::Table,
+            user_data: 0,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+        }];
+        let used = vec![
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 1,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            },
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 8,
+                lower_bound: 1,
+                stride: 1,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            },
+        ];
+        let make_program = |words: &[u32]| NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: layout.clone(),
+            used: used.clone(),
+            io: victory_shader::native::StageIo::Cs(victory_shader::native::ComputeIo {
+                rsrc2: 0,
+                threads: [64, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+
+        // s_mov_b32 s1, 0 (high half of table address = 0, inline constant 0x80);
+        // s_load_dwordx4 s[4:7], s[0:1], 0x20 (load u1 at dword offset 8 into s[4:7]);
+        // buffer_store_dword v0, off, s[4:7], 0;
+        // s_endpgm
+        // Note: SGPR s4 does NOT match lower_bound (1), proving we trace through
+        // `resource::track` rather than comparing SGPR numbers to register bounds.
+        let store_u1 = make_program(&[
+            0xBE81_0380, // s_mov_b32 s1, 0
+            (0x3D << 26) | (2 << 18) | (4 << 6), // s_load_dwordx4 s[4:7], s[0:1], 0x20
+            (125 << 25) | 0x20,
+            0xE070_0000, // buffer_store_dword v0, off, s[4:7], 0
+            0x8001_0000, // srsrc = 4/4 = 1, soffset = 0x80 (0)
+            0xBF81_0000, // s_endpgm
+        ]);
+        let (written, unknown) = super::written_used(&store_u1, &store_u1.used);
+        assert_eq!(written, [false, true]);
+        assert!(!unknown);
+
+        // Load-only shader touching u0 marks neither UAV as written.
+        let load_only = make_program(&[
+            0xBE81_0380, // s_mov_b32 s1, 0
+            (0x3D << 26) | (2 << 18) | (4 << 6), // s_load_dwordx4 s[4:7], s[0:1], 0x00
+            125 << 25,
+            0xE030_0000, // buffer_load_dword v0, off, s[4:7], 0
+            0x8001_0000,
+            0xBF81_0000, // s_endpgm
+        ]);
+        let (written, unknown) = super::written_used(&load_only, &load_only.used);
+        assert_eq!(written, [false, false]);
+        assert!(!unknown);
+
+        // Untraceable store (s[4:7] never loaded from layout) falls back conservatively.
+        let untraceable = make_program(&[
+            0xE070_0000,
+            0x8001_0000,
+            0xBF81_0000,
+        ]);
+        let (written, unknown) = super::written_used(&untraceable, &untraceable.used);
+        assert!(unknown);
+        assert_eq!(written, [true, true]);
+    }
+
+    #[test]
+    fn mesh_per_vertex_center_env_toggle_defaults_on() {
+        use std::ffi::OsStr;
+        assert!(mesh_per_vertex_center_value(None));
+        assert!(mesh_per_vertex_center_value(Some(OsStr::new("1"))));
+        assert!(!mesh_per_vertex_center_value(Some(OsStr::new("0"))));
     }
 }
 

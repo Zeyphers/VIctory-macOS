@@ -82,6 +82,7 @@ fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
+        uav_size_level0: false,
         view_marks: false,
     })
     .map(|_| ())
@@ -139,6 +140,7 @@ fn lower_wave(
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
+        uav_size_level0: false,
         view_marks: false,
     })
 }
@@ -447,6 +449,7 @@ fn perm_features(selector: u32) -> u64 {
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
+        uav_size_level0: false,
         view_marks: false,
     })
     .unwrap();
@@ -1423,6 +1426,7 @@ fn lowered_result(
         atomic_umax: false,
         bias_as_gradients: false,
         narrow_waves,
+        uav_size_level0: false,
         host_wave32: false,
         view_marks: false,
     })
@@ -1479,14 +1483,16 @@ fn a_write_before_divergent_reads_syncs_where_all_lanes_run() {
 
 #[test]
 fn no_barrier_in_divergent_code() {
-    // Write and read both under the branch: no barrier can go there.
+    // Write and read both under a branch: without predication no barrier can
+    // go in divergent code, while lowering with `narrow_waves` predicates the
+    // acyclic diamond and places one uniform barrier between them.
     let mut w = vec![V_LSHLREV_V1_2_V0, SAVE_EXEC, CMPX_V0_EQ_0, skip(4)];
     w.extend(DS_WRITE_V1_V0);
     w.extend(DS_READ_V2_V1_4);
     w.push(RESTORE_EXEC);
     w.push(S_ENDPGM);
     assert!(barriers_at(&wave64(&w)).is_none());
-    assert_eq!(split_barriers(&w, 64, true), 0);
+    assert_eq!(split_barriers(&w, 64, true), 1);
 }
 
 const S_MOV_S20_0: u32 = 0xBE94_0380; // s_mov_b32 s20, 0
@@ -1651,6 +1657,7 @@ fn lowered_halves(words: &[u32], lanes: u32) -> Result<Lowered, crate::ShaderErr
         atomic_umax: false,
         bias_as_gradients: false,
         narrow_waves: false,
+        uav_size_level0: false,
         host_wave32: true,
         view_marks: false,
     })
@@ -2330,6 +2337,7 @@ fn ds_bpermute_wave64_preserves_32_lane_half() {
         atomic_umax: false,
             bias_as_gradients: false,
             narrow_waves: false,
+            uav_size_level0: false,
             host_wave32: false,
             view_marks: false,
         })
@@ -2428,6 +2436,7 @@ fn lower_ps_for_early_z(
         atomic_umax: false,
         bias_as_gradients: false,
         narrow_waves: false,
+        uav_size_level0: false,
         host_wave32: false,
         view_marks,
     })
@@ -2578,10 +2587,11 @@ fn the_null_pair_is_read_once_in_the_entry_block() {
 
 /// A box32 node's last 48 bytes are read through its first 64 bytes'
 /// page-table lookup, and looked up again only in lanes whose node starts
-/// in the last 64 bytes of a page (`raw_load_past`): the head's lookup and
-/// the null pair's view in the entry block, then the head's 16 dwords and
-/// the tail's 12 through that lookup, and the second lookup in a block of
-/// its own.
+/// in the last 64 bytes of a page (`raw_load_past`): the null pair's view
+/// in the entry block, the head's lookup in the `ty < 6` block (so sentinel
+/// `INVALID` and unhandled types 6/7 read nothing), then the head's 16
+/// dwords and the tail's 12 through that lookup, and the second lookup in a
+/// block of its own.
 #[test]
 fn a_box32_nodes_tail_reuses_its_heads_lookup() {
     // The descriptor in s[12:15], based at the pointer.
@@ -2604,13 +2614,298 @@ fn a_box32_nodes_tail_reuses_its_heads_lookup() {
     let at = |b: usize| loads.iter().filter(|&&x| x == b).count();
     assert_eq!(table.len(), 1 + 2 + 2, "{table:?}");
     assert_eq!(loads.len(), 1 + (2 + 4) + 3 + (2 + 3), "{loads:?}");
-    assert_eq!(table[..3], [0; 3], "{table:?}");
+    assert_eq!(table[0], 0, "{table:?}");
+    let head = table[1];
+    assert!(head > 0 && table[2] == head, "{table:?}");
     let again = table[3];
-    assert!(table[4] == again && at(again) == 2, "{loads:?} {table:?}");
-    let through_head = loads.iter().filter(|&&b| b != 0 && b < again);
-    assert_eq!(through_head.count(), 4 + 3, "{loads:?} {table:?}");
+    assert!(again > head && table[4] == again && at(again) == 2, "{loads:?} {table:?}");
+    // Excluding the 2 page-table loads in `head`, the 4 head node loads and
+    // 3 non-crossing tail node loads all reuse `head`'s lookup.
+    let through_head = loads.iter().filter(|&&b| b >= head && b < again).count() - 2;
+    assert_eq!(through_head, 4 + 3, "{loads:?} {table:?}");
 }
 
+#[test]
+fn buffer_load_readfirstlane_loop_is_in_step() {
+    let w: Vec<u32> = vec![
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0B02,
+        0xFA00_0020, // s_load_dwordx4 s[44:47], s[4:5], 0x20
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7E06_0280, // v_mov_b32 v3, 0
+        0xE030_1000,
+        0x800B_0403, // buffer_load_dword v4, v3, s[44:47], 0 offen
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x7E2A_0504, // v_readfirstlane_b32 s21, v4
+        0xBE94_0380, // s_mov_b32 s20, 0
+        // loop body (block 1):
+        0x8014_8114, // s_add_u32 s20, s20, 1
+        0xBF0A_1514, // s_cmp_lt_u32 s20, s21
+        0xBF85_FFFD, // s_cbranch_scc1 -3
+        S_ENDPGM,
+    ];
+    let p = wave64(&w);
+    let st = structure::structure(&p).unwrap();
+    let step = super::in_step(&p, &st);
+    assert!(
+        step.iter().all(|&s| s),
+        "expected all blocks in_step, got {step:?}; exits={:?}; blocks={:?}",
+        st.exits,
+        p.blocks
+            .iter()
+            .map(|b| b
+                .insts
+                .iter()
+                .map(|i| (i.name(), i.reads.clone(), i.writes.clone()))
+                .collect::<Vec<_>>())
+            .collect::<Vec<_>>()
+    );
+}
+
+/// SMEM `op` (`s_load_dword*` 0-4, `s_buffer_load_dword*` 8-12) of
+/// `s[sdata..]` from `s[sbase..]` at `offset`, plus SGPR `soffset` if any.
+fn smem(op: u32, sdata: u32, sbase: u32, offset: u32, soffset: Option<u32>) -> [u32; 2] {
+    [
+        0xF400_0000 | op << 18 | sdata << 6 | sbase >> 1,
+        soffset.unwrap_or(125) << 25 | offset,
+    ]
+}
+
+/// A compute program that loads the raw UAV of the table at `s[uav]` into
+/// s[12:15], runs `body`, and stores `n` registers from `first` on (SGPRs
+/// through v1, or VGPRs if `vector`) to its dwords in order, so every
+/// dword `body` loads is needed.
+fn stored(uav: u32, body: &[u32], first: u32, n: u32, vector: bool) -> Vec<u32> {
+    let mut w = vec![0xBE9A_0300 | uav, 0xBE9B_0380]; // s_mov_b32 s26, s[uav]; s_mov_b32 s27, 0
+    w.extend(smem(2, 12, 26, 0, None)); // s_load_dwordx4 s[12:15], s[26:27], 0
+    w.extend(body);
+    w.push(0xBF8C_0000); // s_waitcnt vmcnt(0) lgkmcnt(0)
+    for k in 0..n {
+        let v = if vector {
+            first + k
+        } else {
+            w.push(0x7E02_0200 | (first + k)); // v_mov_b32 v1, s[first + k]
+            1
+        };
+        // buffer_store_dword v, off, s[12:15], 0 offset:4k
+        w.extend([0xE070_0000 | (4 * k), 0x8003_0000 | v << 8]);
+    }
+    w.push(S_ENDPGM);
+    w
+}
+
+fn used(kind: ResourceType, root: RootType, user_data: u8, slot: u8) -> UsedResource {
+    UsedResource {
+        kind,
+        root,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 0,
+        dwords: if root == RootType::Descriptor { 2 } else { 4 },
+        user_data,
+        slot,
+    }
+}
+
+/// `s_buffer_load_dword*` `op` of s[32..] at `offset` (plus s2 if
+/// `soffset`) through the constant buffer in the table at s0; the UAV's
+/// table at s1.
+fn table_constants(op: u32, offset: u32, soffset: bool) -> Lowered {
+    let mut body = vec![0xBE84_0300, 0xBE85_0380]; // s_mov_b32 s4, s0; s_mov_b32 s5, 0
+    body.extend(smem(2, 8, 4, 0, None)); // s_load_dwordx4 s[8:11], s[4:5], 0
+    body.push(0xBF8C_0000);
+    body.extend(smem(op, 32, 8, offset, soffset.then_some(2)));
+    let layout = vec![
+        root(RootType::Table, 0, 0),
+        root(RootType::Table, 1, 1),
+        root(RootType::Constants, 2, 2),
+    ];
+    let used = vec![
+        used(ResourceType::Cbv, RootType::Table, 0, 0),
+        used(ResourceType::Uav, RootType::Table, 1, 1),
+    ];
+    lower_with(&stored(1, &body, 32, 1 << (op - 8), false), layout, used).unwrap()
+}
+
+/// `s_buffer_load_dword*` `op` of s[32..] at 0 through the constant buffer
+/// at the heap index in s0 (the resource heap at s1); the UAV's table at s2.
+fn heap_constants(op: u32) -> Lowered {
+    let mut body = vec![0x8F04_8500, 0xBE94_0301, 0xBE95_0380]; // s_lshl_b32 s4, s0, 5; s[20:21] = s1, 0
+    body.extend(smem(2, 8, 20, 0, Some(4))); // s_load_dwordx4 s[8:11], s[20:21], s4
+    body.push(0xBF8C_0000);
+    body.extend(smem(op, 32, 8, 0, None));
+    let layout = vec![
+        root(RootType::Constants, 0, 0),
+        root(RootType::ResourceHeap, 1, 1),
+        root(RootType::Table, 2, 2),
+    ];
+    let used = vec![used(ResourceType::Uav, RootType::Table, 2, 2)];
+    lower_with(&stored(2, &body, 32, 1 << (op - 8), false), layout, used).unwrap()
+}
+
+/// A buffer descriptor built around the root CBV at s[0:1], in s[8:11].
+const ROOT_CBV_DESCRIPTOR: [u32; 5] = [
+    0xBE88_0300, // s_mov_b32 s8, s0
+    0xBE89_0301, // s_mov_b32 s9, s1
+    0xBE8A_03C1, // s_mov_b32 s10, -1
+    0xBE8B_03FF,
+    0x2100_0FAC, // s_mov_b32 s11, 0x21000fac
+];
+
+fn root_cbv_layout() -> (Vec<RootParam>, Vec<UsedResource>) {
+    (
+        vec![
+            root(RootType::Descriptor, 0, 0),
+            root(RootType::Constants, 2, 1),
+            root(RootType::Table, 3, 2),
+        ],
+        vec![
+            used(ResourceType::Cbv, RootType::Descriptor, 0, 0),
+            used(ResourceType::Uav, RootType::Table, 3, 2),
+        ],
+    )
+}
+
+/// `s_buffer_load_dword*` `op` of s[32..] through the root CBV at s[0:1],
+/// at 4 plus s2 if `soffset`; the UAV's table at s3.
+fn root_constants(op: u32, soffset: bool) -> Lowered {
+    let mut body = ROOT_CBV_DESCRIPTOR.to_vec();
+    body.extend(smem(op, 32, 8, 4, soffset.then_some(2)));
+    let (layout, used) = root_cbv_layout();
+    lower_with(&stored(3, &body, 32, 1 << (op - 8), false), layout, used).unwrap()
+}
+
+/// `buffer_load_dwordx4 v[4:7], v0, s[8:11], 0 offen offset:4`: a row of
+/// constants per lane through the constant buffer in the table at s0, or
+/// through the root CBV at s[0:1] (the UAV's table at s3).
+fn lane_constants(table: bool) -> Lowered {
+    let mut body = if table {
+        let mut b = vec![0xBE84_0300, 0xBE85_0380];
+        b.extend(smem(2, 8, 4, 0, None));
+        b.push(0xBF8C_0000);
+        b
+    } else {
+        ROOT_CBV_DESCRIPTOR.to_vec()
+    };
+    body.extend([0xE038_1004, 0x8002_0400]);
+    let (layout, used) = if table {
+        (
+            vec![root(RootType::Table, 0, 0), root(RootType::Table, 3, 2)],
+            vec![
+                used(ResourceType::Cbv, RootType::Table, 0, 0),
+                used(ResourceType::Uav, RootType::Table, 3, 2),
+            ],
+        )
+    } else {
+        root_cbv_layout()
+    };
+    lower_with(&stored(3, &body, 4, 4, true), layout, used).unwrap()
+}
+
+/// `global_load_dword*` `op` (12, 13, 15, 14: one to four dwords) of v[4..]
+/// at 8 through the root SRV at s[0:1]; the UAV's table at s2.
+fn root_view_load(op: u32, n: u32) -> Lowered {
+    let body = [
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0xDC00_8008 | op << 18,
+        0x0400_0001, // global_load_dword* v[4..], v1, s[0:1] offset:8
+    ];
+    let layout = vec![
+        root(RootType::Descriptor, 0, 0),
+        root(RootType::Table, 2, 1),
+    ];
+    let used = vec![
+        used(ResourceType::Srv, RootType::Descriptor, 0, 0),
+        used(ResourceType::Uav, RootType::Table, 2, 1),
+    ];
+    lower_with(&stored(2, &body, 4, n, true), layout, used).unwrap()
+}
+
+/// `s_load_dword*` `op` of s[32..] from title memory at the pointer in
+/// root constants s[0:1]; the UAV's table at s2.
+fn memory_constants(op: u32) -> Lowered {
+    let body = smem(op, 32, 0, 0x10, None);
+    let layout = vec![
+        RootParam {
+            sgprs: 2,
+            ..root(RootType::Constants, 0, 0)
+        },
+        root(RootType::Table, 2, 1),
+    ];
+    let used = vec![used(ResourceType::Uav, RootType::Table, 2, 1)];
+    lower_with(&stored(2, &body, 32, 1 << op, false), layout, used).unwrap()
+}
+
+/// `l`'s raw buffer loads of more than one dword (the page table's and the
+/// stride guard's read one).
+fn wide_loads(l: &Lowered) -> Vec<(Option<i64>, Option<i64>)> {
+    l.raw_load_args
+        .iter()
+        .copied()
+        .filter(|&(_, m)| m != Some(1))
+        .collect()
+}
+
+/// Constants through a raw view are read four dwords a load, at any
+/// 4-byte offset (raw loads need no more alignment), the last load masked
+/// to what is left.
+#[test]
+fn scalar_buffer_loads_read_four_dwords_a_load() {
+    let four = |at: i64, n: i64| {
+        (0..n)
+            .map(|k| (Some(at + 16 * k), Some(15)))
+            .collect::<Vec<_>>()
+    };
+    // In a table, at a fixed offset.
+    assert_eq!(
+        table_constants(8, 0, false).raw_load_args,
+        [(Some(0), Some(1))]
+    );
+    assert_eq!(
+        table_constants(9, 0, false).raw_load_args,
+        [(Some(0), Some(3))]
+    );
+    assert_eq!(table_constants(10, 0, false).raw_load_args, four(0, 1));
+    assert_eq!(table_constants(11, 4, false).raw_load_args, four(4, 2));
+    assert_eq!(table_constants(12, 4, false).raw_load_args, four(4, 4));
+    // At a computed one.
+    assert_eq!(
+        table_constants(12, 4, true).raw_load_args,
+        [(None, Some(15)); 4]
+    );
+    // Through the heap itself, beside the stride guard's load.
+    let heap = heap_constants(12);
+    assert_eq!(heap.raw_load_args.len(), 5);
+    assert_eq!(wide_loads(&heap), four(0, 4));
+    // Per lane through a table, and global loads through a root view.
+    assert_eq!(lane_constants(true).raw_load_args, [(None, Some(15))]);
+    for (op, n, mask) in [(13, 2, 3), (15, 3, 7), (14, 4, 15)] {
+        assert_eq!(root_view_load(op, n).raw_load_args, [(None, Some(mask))]);
+    }
+    // From title memory: the page table's entry (two dwords) and the
+    // constants, then a dword a load again in a block of their own, which
+    // only lanes whose run wraps (it starts before its copy) run.
+    let memory = memory_constants(4);
+    assert_eq!(wide_loads(&memory)[1..], [(None, Some(15)); 4]);
+    assert_eq!(memory.raw_load_args[7..], [(None, Some(1)); 16]);
+    let [blocks, _] = &memory.raw_loads;
+    let wraps = blocks[7];
+    assert!(blocks[..7].iter().all(|&b| b != wraps), "{blocks:?}");
+    assert!(blocks[7..].iter().all(|&b| b == wraps), "{blocks:?}");
+}
+
+/// Constants at a computed offset of a constant buffer view load each row
+/// the run touches once: one more row than its aligned rows, which an
+/// unaligned run reaches into. The user data take a row, and one more with
+/// the offset in a root constant.
+#[test]
+fn constants_at_a_computed_offset_load_each_row_once() {
+    let rows = [8, 9, 10, 11, 12].map(|op| root_constants(op, true).cbuffer_rows - 2);
+    assert_eq!(rows, [1, 2, 2, 3, 5]);
+    // Per lane: four dwords, two rows.
+    assert_eq!(lane_constants(false).cbuffer_rows - 1, 2);
+}
 /// Lowers a wave64 compute program of 64 threads as a host of 32-lane waves
 /// runs it (`host_wave32`: the console wave is two halves), with root
 /// constants in s[0:3] and no LDS (halves refuse one console wave's LDS).
@@ -2660,24 +2955,34 @@ fn lower_halves_io(
     let st = structure::structure(&p).unwrap();
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
     let io = io::raise(&p, &native).unwrap();
-    lower(&Parts {
-        native: &native,
-        p: &p,
-        st: &st,
-        io: &io,
-        res: &res,
-        inputs: vec![],
-        outputs: vec![],
-        prims: vec![],
-        mesh_stride: 0,
-        atomic_locks: false,
-        atomic_lock_rounds: false,
-        atomic_umax: false,
-        bias_as_gradients: false,
-        host_wave32: true,
-        narrow_waves: false,
-        view_marks: false,
-    })
+    // These tests probe the value analysis behind each refusal, which
+    // selective predication of a divergent branch would route around.
+    super::NO_PREDICATION.with(|c| c.set(true));
+    // The wave ticket's own barrier would count among the exchanges these
+    // tests look for, so they lower without it.
+    let lowered = crate::emit::with_thread_ticket(false, || {
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+            atomic_locks: false,
+            atomic_lock_rounds: false,
+            atomic_umax: false,
+            bias_as_gradients: false,
+            host_wave32: true,
+            narrow_waves: false,
+            uav_size_level0: false,
+            view_marks: false,
+        })
+    });
+    super::NO_PREDICATION.with(|c| c.set(false));
+    lowered
 }
 
 /// A `v_writelane_b32` asks for the console's lane layout (so the program
