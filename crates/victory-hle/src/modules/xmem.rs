@@ -1837,18 +1837,33 @@ pub mod low_guards {
 
         static TEST: Mutex<()> = Mutex::new(());
 
+        /// A guard of four granules, reserved top-down: other test threads
+        /// allocate bottom-up, so none of them takes the space between its
+        /// release in `retry` and its reservation again. Reserving a hole,
+        /// freeing it and guarding it left the same gap, and on 18 test
+        /// threads these tests failed about once in 20 runs (#320).
+        fn high_guard() -> usize {
+            // windows-sys has it only under System_SystemServices.
+            const MEM_TOP_DOWN: u32 = 0x0010_0000;
+            // SAFETY: a fresh reservation of free address space.
+            let at = unsafe {
+                VirtualAlloc(
+                    std::ptr::null(),
+                    4 * GRANULE,
+                    MEM_RESERVE | MEM_TOP_DOWN,
+                    PAGE_NOACCESS,
+                )
+            } as usize;
+            assert_ne!(at, 0);
+            guards().push((at, 4 * GRANULE));
+            at
+        }
+
         #[test]
         fn a_refused_retry_leaves_the_guards_in_place() {
             let _one = TEST.lock().unwrap();
-            // SAFETY: a fresh reservation, released at once.
-            let hole =
-                unsafe { VirtualAlloc(std::ptr::null(), 4 * GRANULE, MEM_RESERVE, PAGE_NOACCESS) };
-            assert!(!hole.is_null());
-            let first = hole as usize;
-            // SAFETY: ours.
-            assert_ne!(unsafe { VirtualFree(hole, 0, MEM_RELEASE) }, 0);
-            assert!(guard(first, 4 * GRANULE));
-            guards().push((first, 4 * GRANULE));
+            let first = high_guard();
+            let hole = first as *mut std::ffi::c_void;
             let mut attempts = 0;
             let result = retry(4 * GRANULE, || {
                 attempts += 1;
@@ -1866,16 +1881,7 @@ pub mod low_guards {
         #[test]
         fn a_released_guard_is_guarded_again_around_what_took_it() {
             let _one = TEST.lock().unwrap();
-            // A known hole of four granules: reserved, then freed.
-            // SAFETY: a fresh reservation, released at once.
-            let hole =
-                unsafe { VirtualAlloc(std::ptr::null(), 4 * GRANULE, MEM_RESERVE, PAGE_NOACCESS) }
-                    as usize;
-            assert_ne!(hole, 0);
-            // SAFETY: ours.
-            unsafe { VirtualFree(hole as *mut _, 0, MEM_RELEASE) };
-            assert!(guard(hole, 4 * GRANULE));
-            guards().push((hole, 4 * GRANULE));
+            let hole = high_guard();
             let taken = retry(GRANULE, || {
                 // SAFETY: a reservation of the first granule at a known address.
                 unsafe { VirtualAlloc(hole as *const _, GRANULE, MEM_RESERVE, PAGE_NOACCESS) }
