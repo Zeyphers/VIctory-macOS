@@ -2426,6 +2426,7 @@ mod tests {
             unsafe { p1.cast::<u32>().add(i as usize).write_volatile(0xA1B2_0000 + i) };
         }
         let s1 = crate::shadow::find(p1 as u64, 256).expect("upload 1 registered in shadow");
+        let r1 = s1.range();
         wait64(list, flag_addr, GREATER_EQUAL, 1, 0);
         {
             let h1 = host_list(list).expect("host list for batch 1");
@@ -2459,6 +2460,7 @@ mod tests {
             unsafe { p2.cast::<u32>().add(i as usize).write_volatile(0xC3D4_0000 + i) };
         }
         let s2 = crate::shadow::find(p2 as u64, 256).expect("upload 2 registered in shadow");
+        let r2 = s2.range();
         {
             let h2 = host_list(list).expect("host list for batch 2");
             s2.refresh(h2, p2 as u64, 256);
@@ -2492,9 +2494,12 @@ mod tests {
         // The finished batches, uploads included, are dropped on the
         // release thread, behind what other tests retired.
         crate::host::wait_for_releases();
+        // Freed, their addresses can go to a test running beside this one, so
+        // only the uploads' own copies must be gone.
+        let gone =
+            |p: *mut u8, r| crate::shadow::find(p as u64, 256).is_none_or(|s| s.range() != r);
         assert!(
-            crate::shadow::find(p1 as u64, 256).is_none()
-                && crate::shadow::find(p2 as u64, 256).is_none(),
+            gone(p1, r1) && gone(p2, r2),
             "both uploads must be unregistered and freed once held lists finish"
         );
 
