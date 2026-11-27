@@ -318,6 +318,17 @@ fn thread_ticket_value(value: Option<&std::ffi::OsStr>) -> bool {
     value != Some(std::ffi::OsStr::new("0"))
 }
 
+/// Whether a group barrier is kept where a lane may have left the program
+/// early at a loop's iteration limit (`VICTORY_BARRIER_AFTER_CAP=1`), in
+/// place of refusing the whole program. Off by default: a lane that really
+/// reaches the limit leaves the rest of its group waiting at the barrier.
+/// Real loops stay far below the limit, and without it programs such as
+/// Series 1.0.2.1's TAA resolve (`CS_TAA2_Resolve`) do not translate.
+pub fn barrier_after_cap() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BARRIER_AFTER_CAP").is_some_and(|v| v == "1"))
+}
+
 #[cfg(test)]
 std::thread_local! {
     static TEST_THREAD_TICKET: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };

@@ -73,6 +73,7 @@ fn build() -> &'static [u8; 32] {
             limit,
             host_wave32(),
             victory_shader::emit::thread_ticket(),
+            victory_shader::emit::barrier_after_cap(),
         )
     })
 }
@@ -93,12 +94,13 @@ fn key(
     limit: u32,
     wave32: bool,
     thread_ticket: bool,
+    barrier_after_cap: bool,
 ) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(translator.as_bytes());
     h.update(blake3::hash(encoding).as_bytes());
     h.update(&limit.to_le_bytes());
-    h.update(&[u8::from(wave32), u8::from(thread_ticket)]);
+    h.update(&[u8::from(wave32), u8::from(thread_ticket), u8::from(barrier_after_cap)]);
     *h.finalize().as_bytes()
 }
 
@@ -981,13 +983,14 @@ mod tests {
     /// another key, so no entry written before it is read.
     #[test]
     fn the_key_covers_translator_encoding_and_settings() {
-        let k = key("0123456789abcdef", b"encoding", 1 << 20, false, true);
-        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20, false, true));
-        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20, false, true));
-        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20, false, true));
-        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19, false, true));
-        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 20, true, true));
-        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 20, false, false));
+        let k = key("0123456789abcdef", b"encoding", 1 << 20, false, true, false);
+        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20, false, true, false));
+        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20, false, true, false));
+        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20, false, true, false));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19, false, true, false));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 20, true, true, false));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 20, false, false, false));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 20, false, true, true));
         assert_eq!(
             *build(),
             key(
@@ -996,6 +999,7 @@ mod tests {
                 victory_shader::emit::loop_limit(),
                 host_wave32(),
                 victory_shader::emit::thread_ticket(),
+                victory_shader::emit::barrier_after_cap(),
             )
         );
         // The encoding part is this file as built.
